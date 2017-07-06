@@ -39,7 +39,9 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
     private boolean isShutDownRequested = false;
     
     AsynchronousServerSocketChannel serverSocketChannel;
-    private void startSocket() {
+    
+    @Override
+    public void start() throws Exception {
     	try {
 			this.serverSocketChannel = AsynchronousServerSocketChannel.open();
 			this.serverSocketChannel.bind( new InetSocketAddress( this.port ) );
@@ -68,7 +70,7 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
 		}
     }
     
-    public void sendPolicy( AsynchronousSocketChannel clientSocket ) {
+    protected void sendPolicy( AsynchronousSocketChannel clientSocket ) {
     	if( clientSocket != null ) {
 	        try {
 	        	
@@ -158,11 +160,6 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         } else {
         	logger.info( "Using default policy file: " + POLICY_RESPONCE );
         }
-    }
-
-    @Override
-    public void start() throws Exception {
-        startSocket();
     }
 
     @Override
