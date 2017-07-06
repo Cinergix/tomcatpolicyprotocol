@@ -4,16 +4,14 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.util.concurrent.BlockingQueue;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousServerSocketChannel;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.CompletionHandler;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future;
 import java.util.logging.Logger;
 
 import org.apache.coyote.Adapter;
@@ -37,62 +35,73 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
     protected static String POLICY_RESPONCE = "<cross-domain-policy><site-control permitted-cross-domain-policies=\"master-only\"/><allow-access-from domain=\"*\" to-ports=\"*\" /></cross-domain-policy>\0";
 
     private String policyFilePath;
-
     private Adapter adapter;
-
-    private BlockingQueue<Runnable> queue = new LinkedBlockingQueue<Runnable>();
-    private ThreadPoolExecutor executor = null;
-    private ServerSocket serverSocket = null;
     private boolean isShutDownRequested = false;
     
-    private int maxThreadPoolSize = 5;
-    private int keepAliveTime = 60;
-
+    AsynchronousServerSocketChannel serverSocketChannel;
     private void startSocket() {
-    	
-        Thread thread = new Thread( new Runnable() {
-            public void run() {
-                try {
-                    serverSocket = new ServerSocket(port);
-                } catch (IOException e) {
-                    logger.severe("Could not listen on port: " + port);
-                    System.exit(1);
-                }
+    	try {
+			this.serverSocketChannel = AsynchronousServerSocketChannel.open();
+			this.serverSocketChannel.bind( new InetSocketAddress( this.port ) );
+			this.serverSocketChannel.accept( this.serverSocketChannel, new CompletionHandler<AsynchronousSocketChannel, AsynchronousServerSocketChannel>() {
 
-                while (!shutDownRequested()) {
-                    Socket clientSocket;
-                    try {
-                        clientSocket = serverSocket.accept();
-                    } catch (IOException e) {
-                        logger.severe("Socket accept failed: " + e.getMessage());
-                        continue;
-                    }
-                    try {
-                        executor.execute( new WorkerRunnable( clientSocket ) );
-                    }
-                    catch (RejectedExecutionException e) {
-                        logger.severe("Executor rejected execution: " + e.getMessage());
-                        try {
-                            clientSocket.close();
-                        } catch (IOException e1) {
-                        	logger.severe("Error closing client: " + e1.getMessage());
-                        }
-                    }
-                }
-            }
-        }, "SocketLoop" );
-        thread.start();
+				@Override
+				public void completed(AsynchronousSocketChannel result, AsynchronousServerSocketChannel attachment) {
+					logger.fine( "New connection accpted" );
+					if( !shutDownRequested() ) {
+						serverSocketChannel.accept( serverSocketChannel, this );
+					}
+					sendPolicy( result );
+				}
+
+				@Override
+				public void failed(Throwable exc, AsynchronousServerSocketChannel attachment) {
+					if( !shutDownRequested() ) {
+						serverSocketChannel.accept( serverSocketChannel, this );
+						logger.severe("Unable to create connection with client.\n" + exc.getMessage());
+					}
+				}
+				
+			});
+		} catch (IOException e) {
+			logger.severe("Unable to create server socket.\n" + e.getMessage());
+		}
+    }
+    
+    public void sendPolicy( AsynchronousSocketChannel clientSocket ) {
+    	if( clientSocket != null ) {
+	        try {
+	        	
+	        	ByteBuffer buffer = ByteBuffer.allocate( 1024 );
+	        	Future<Integer> future = clientSocket.read( buffer );
+				if( ( future.get() == 23 ) && ( new String( buffer.array() ) ).startsWith( EXPECTED_REQUEST ) ) {
+					buffer = ByteBuffer.wrap( POLICY_RESPONCE.getBytes() );
+					clientSocket.write( buffer );
+				}
+	        } catch (InterruptedException e) {
+	        	logger.severe("Reading policy file request is interupted.\n" + e.getMessage());
+			} catch (ExecutionException e) {
+				logger.severe("Reading policy file request is interupted.\n" + e.getMessage());
+	        } finally {
+	            try {
+	                clientSocket.close();
+	                logger.fine("Closing client socket.");
+	            } catch (IOException e) {
+	            	logger.severe("Error while closing socket connection.\n" + e.getMessage());
+	            }
+	        }
+    	}
     }
 
     private synchronized boolean shutDownRequested() {
         return this.isShutDownRequested;
     }
-
+    
     private synchronized void requestShutDown() {
         this.isShutDownRequested = true;
-        if( this.serverSocket != null ) {
+        if( this.serverSocketChannel != null ) {
 	        try {
-	            this.serverSocket.close();
+	            this.serverSocketChannel.close();
 	        } catch (IOException e) {
 	        	logger.severe("Error closing server" + e.getMessage());
 	        }
@@ -114,30 +123,6 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
     public int getPort() {
         return this.port;
     }
-
-    public int getMaxThreadPoolSize() {
-		return maxThreadPoolSize;
-	}
-
-	public void setMaxThreadPoolSize(String maxThreadPoolSize) {
-		try {
-		this.maxThreadPoolSize = Integer.parseInt( maxThreadPoolSize );
-		} catch( Exception e ) {
-			logger.warning( "Max threadpool size for policy server is not an integer. Default value 5 is set." );
-		}
-	}
-
-	public int getKeepAliveTime() {
-		return keepAliveTime;
-	}
-
-	public void setKeepAliveTime(String keepAliveTime) {
-		try {
-			this.keepAliveTime = Integer.parseInt( keepAliveTime );
-		} catch( Exception e ) {
-			logger.warning( "Keepalive time for policy server connector is not an integer. Default value 60 is set." );
-		}
-	}
 
 	@Override
     public void setAdapter(Adapter adapter) {
@@ -173,8 +158,6 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         } else {
         	logger.info( "Using default policy file: " + POLICY_RESPONCE );
         }
-        
-        this.executor = new ThreadPoolExecutor( 1, this.maxThreadPoolSize, this.keepAliveTime, TimeUnit.SECONDS, queue );
     }
 
     @Override
@@ -193,12 +176,11 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
     @Override
     public void destroy() throws Exception {
     	this.requestShutDown();
-        this.executor.shutdown();
     }
 
 	@Override
 	public Executor getExecutor() {
-		return this.executor;
+		return null;
 	}
 
 	@Override
@@ -226,57 +208,4 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
 		this.requestShutDown();
 	}
 
-}
-
-class WorkerRunnable implements Runnable {
-    Socket clientSocket;
-    Logger logger = Logger.getLogger(WorkerRunnable.class.getName());
-
-    public WorkerRunnable( Socket clientSocket ) {
-        this.clientSocket = clientSocket;
-    }
-
-    @Override
-    public void run() {
-        OutputStream out = null;
-        InputStream in = null;
-        try {
-            out = clientSocket.getOutputStream();
-            in = clientSocket.getInputStream();
-            byte[] buf = new byte[1024];
-            int count;
-            
-            while ( ( count = in.read( buf ) ) > 0 ) {
-            	
-                if (count == 23 && new String(buf).startsWith( SocketPolicyProtocolHandler.EXPECTED_REQUEST ) ) {
-                    try {
-                        out.write( SocketPolicyProtocolHandler.POLICY_RESPONCE.getBytes() );
-                        logger.info( "Sent policy" );
-                    } catch (IOException ex) {
-                    	logger.severe( "Error sending policy file.\n" + ex.getStackTrace() );
-                    }
-
-                } else {
-                    out.write(buf, 0, count);
-                    logger.info( "Ignoring Request. Receied wrong request text " + new String( buf ) );
-                }
-            }
-        } catch (IOException e) {
-        	logger.severe("Socket read failed: " + e.getMessage());
-        } finally {
-            try {
-                if (out != null) {
-                    out.flush();
-                    out.close();
-                    logger.info("Flush output and close output stream.");
-                }
-                if (in != null) {
-                    in.close();
-                    logger.info("Close input stream.");
-                }
-            } catch (IOException e) {
-            	logger.severe("Error closing input stream and outputstream.\n" + e.getMessage());
-            }
-        }
-    }
 }
