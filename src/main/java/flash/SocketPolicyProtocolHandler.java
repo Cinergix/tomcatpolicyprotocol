@@ -12,6 +12,8 @@ import java.nio.channels.CompletionHandler;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Logger;
 
 import org.apache.coyote.Adapter;
@@ -37,9 +39,12 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
     private String policyFilePath;
     private Adapter adapter;
     private boolean isShutDownRequested = false;
+    private long socketTimeout = 30;
     
     AsynchronousServerSocketChannel serverSocketChannel;
-    
+    /**
+     * Creates an asynchronous Server socket and waits for the connection using a listener. 
+     */
     @Override
     public void start() throws Exception {
     	try {
@@ -70,16 +75,25 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
 		}
     }
     
+    /**
+     * Reads the request string from given connection. If the request string is equal to 
+     * the flash policy request then writes the policy string back and disconnects the 
+     * socket. If there is no request string received within the timeout period then 
+     * simply closes the connection.
+     * @param clientSocket
+     */
     protected void sendPolicy( AsynchronousSocketChannel clientSocket ) {
     	if( clientSocket != null ) {
 	        try {
 	        	
 	        	ByteBuffer buffer = ByteBuffer.allocate( 1024 );
 	        	Future<Integer> future = clientSocket.read( buffer );
-				if( ( future.get() == 23 ) && ( new String( buffer.array() ) ).startsWith( EXPECTED_REQUEST ) ) {
+				if( ( future.get( this.socketTimeout, TimeUnit.SECONDS ) == 23 ) && ( new String( buffer.array() ) ).startsWith( EXPECTED_REQUEST ) ) {
 					buffer = ByteBuffer.wrap( POLICY_RESPONCE.getBytes() );
 					clientSocket.write( buffer );
 				}
+	        }catch (TimeoutException e) {
+	        	logger.severe("No request string is receieved from the connection until connection times out.\n" + e.getMessage());
 	        } catch (InterruptedException e) {
 	        	logger.severe("Reading policy file request is interupted.\n" + e.getMessage());
 			} catch (ExecutionException e) {
@@ -99,6 +113,9 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         return this.isShutDownRequested;
     }
     
+    /**
+     * Stop server socket form listening for client connection.
+     */
     private synchronized void requestShutDown() {
         this.isShutDownRequested = true;
         if( this.serverSocketChannel != null ) {
@@ -114,17 +131,17 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         this.policyFilePath = policyFile;
     }
 
-    public String getPolicyFile() {
-        return this.policyFilePath;
-    }
-
     public void setPort(int port) {
         this.port = port;
     }
 
-    public int getPort() {
-        return this.port;
-    }
+	public void setSocketTimeout(String timeout) {
+		try {
+			this.socketTimeout = Long.parseLong( timeout );
+		}catch( NumberFormatException e ) {
+			logger.severe( "Unable to covert timout value from connetor. Default value 60S is used." );
+		}
+	}
 
 	@Override
     public void setAdapter(Adapter adapter) {
@@ -136,6 +153,9 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         return adapter;
     }
 
+    /**
+     * Initializes the parameters for flash socket policy server.
+     */
     @Override
     public void init() {
     	
