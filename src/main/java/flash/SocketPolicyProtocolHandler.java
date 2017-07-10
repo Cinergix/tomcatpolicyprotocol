@@ -1,95 +1,129 @@
-/*
- * Copyright (c) 2009, CoreMedia AG, Hamburg. All rights reserved.
- */
 package flash;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousServerSocketChannel;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.CompletionHandler;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Logger;
 
 import org.apache.coyote.Adapter;
 import org.apache.coyote.ProtocolHandler;
 
-import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.concurrent.*;
-import java.util.logging.Logger;
-
 /**
- * ProtocolHandler that serves a Flash Socket policy file. This is needed for Flash/Flex applications,
- * that want to use Sockets to talk to the server.
- * You can configure the port (default is 843) and the path of the policy file (default allows access from domain "localhost"
- * to port 80 for http over sockets)
+ * ProtocolHandler that serves a Flash Socket policy file. This is needed for 
+ * Flash/Flex applications, that want to use Sockets to talk to the server.
+ * You can configure the port (default is 843) and the path of the policy file 
+ * ( default allows access from all domain to any port for http over sockets )
  */
 public class SocketPolicyProtocolHandler implements ProtocolHandler {
-    private final Logger LOG = Logger.getLogger(SocketPolicyProtocolHandler.class.getName());
+    private final Logger logger = Logger.getLogger(SocketPolicyProtocolHandler.class.getName());
+    
+    /**
+     * Port number to accept the connections. By default it uses port number 843.
+     */
+    private int port = 843;
 
-    private static final int DEFAULT_PORT = 843;
-    private int port = DEFAULT_PORT;
-
-    protected static final String expectedRequest = "<policy-file-request/>\0";
+    protected static final String EXPECTED_REQUEST = "<policy-file-request/>\0";
+    protected static String POLICY_RESPONCE = "<cross-domain-policy><site-control permitted-cross-domain-policies=\"master-only\"/><allow-access-from domain=\"*\" to-ports=\"*\" /></cross-domain-policy>\0";
 
     private String policyFilePath;
-
     private Adapter adapter;
-
-    private String policy = "<?xml version=\"1.0\"?>\n" +
-            "<!DOCTYPE cross-domain-policy SYSTEM \"/xml/dtds/cross-domain-policy.dtd\">\n" +
-            "<cross-domain-policy>\n" +
-            "   <site-control permitted-cross-domain-policies=\"master-only\"/>\n" +
-            "   <allow-access-from domain=\"localhost\" to-ports=\"80\" />\n" +
-            "</cross-domain-policy>\0";
-    private Map<String, Object> attributes = new HashMap<String, Object>();
-
-    private BlockingQueue<Runnable> queue = new LinkedBlockingQueue<Runnable>();
-    private ThreadPoolExecutor executor = new ThreadPoolExecutor(1, 100, 60, TimeUnit.SECONDS, queue);
-    private ServerSocket serverSocket = null;
     private boolean isShutDownRequested = false;
+    private long socketTimeout = 30;
+    
+    AsynchronousServerSocketChannel serverSocketChannel;
+    /**
+     * Creates an asynchronous Server socket and waits for the connection using a listener. 
+     */
+    @Override
+    public void start() throws Exception {
+    	try {
+			this.serverSocketChannel = AsynchronousServerSocketChannel.open();
+			this.serverSocketChannel.bind( new InetSocketAddress( this.port ) );
+			this.serverSocketChannel.accept( this.serverSocketChannel, new CompletionHandler<AsynchronousSocketChannel, AsynchronousServerSocketChannel>() {
 
-    private void startSocket() {
-        new Thread(new Runnable() {
-            public void run() {
-                try {
-                    serverSocket = new ServerSocket(port);
-                } catch (IOException e) {
-                    LOG.severe("Could not listen on port: " + port);
-                    System.exit(1);
-                }
+				@Override
+				public void completed(AsynchronousSocketChannel result, AsynchronousServerSocketChannel attachment) {
+					logger.fine( "New connection accpted" );
+					if( !shutDownRequested() ) {
+						serverSocketChannel.accept( serverSocketChannel, this );
+					}
+					sendPolicy( result );
+				}
 
-                while (!shutDownRequested()) {
-                    Socket clientSocket;
-                    try {
-                        clientSocket = serverSocket.accept();
-                    } catch (IOException e) {
-                        LOG.severe("Socket accept failed: " + e.getMessage());
-                        continue;
-                    }
-                    try {
-                        executor.execute(new WorkerRunnable(clientSocket, policy));
-                    }
-                    catch (RejectedExecutionException e) {
-                        LOG.severe("Executor rejected execution: " + e.getMessage());
-                        try {
-                            clientSocket.close();
-                        } catch (IOException e1) {
-                            LOG.severe("Error closing client: " + e1.getMessage());
-                        }
-                    }
-                }
-            }
-        }, "SocketLoop").start();
+				@Override
+				public void failed(Throwable exc, AsynchronousServerSocketChannel attachment) {
+					if( !shutDownRequested() ) {
+						serverSocketChannel.accept( serverSocketChannel, this );
+						logger.severe("Unable to create connection with client.\n" + exc.getMessage());
+					}
+				}
+				
+			});
+		} catch (IOException e) {
+			logger.severe("Unable to create server socket.\n" + e.getMessage());
+		}
+    }
+    
+    /**
+     * Reads the request string from given connection. If the request string is equal to 
+     * the flash policy request then writes the policy string back and disconnects the 
+     * socket. If there is no request string received within the timeout period then 
+     * simply closes the connection.
+     * @param clientSocket
+     */
+    protected void sendPolicy( AsynchronousSocketChannel clientSocket ) {
+    	if( clientSocket != null ) {
+	        try {
+	        	
+	        	ByteBuffer buffer = ByteBuffer.allocate( 1024 );
+	        	Future<Integer> future = clientSocket.read( buffer );
+				if( ( future.get( this.socketTimeout, TimeUnit.SECONDS ) == 23 ) && ( new String( buffer.array() ) ).startsWith( EXPECTED_REQUEST ) ) {
+					buffer = ByteBuffer.wrap( POLICY_RESPONCE.getBytes() );
+					clientSocket.write( buffer );
+				}
+	        }catch (TimeoutException e) {
+	        	logger.severe("No request string is receieved from the connection until connection times out.\n" + e.getMessage());
+	        } catch (InterruptedException e) {
+	        	logger.severe("Reading policy file request is interupted.\n" + e.getMessage());
+			} catch (ExecutionException e) {
+				logger.severe("Reading policy file request is interupted.\n" + e.getMessage());
+	        } finally {
+	            try {
+	                clientSocket.close();
+	                logger.fine("Closing client socket.");
+	            } catch (IOException e) {
+	            	logger.severe("Error while closing socket connection.\n" + e.getMessage());
+	            }
+	        }
+    	}
     }
 
     private synchronized boolean shutDownRequested() {
         return this.isShutDownRequested;
     }
-
+    
+    /**
+     * Stop server socket form listening for client connection.
+     */
     private synchronized void requestShutDown() {
         this.isShutDownRequested = true;
-        try {
-            this.serverSocket.close();
-        } catch (IOException e) {
-            LOG.severe("Error closing server" + e.getMessage());
+        if( this.serverSocketChannel != null ) {
+	        try {
+	            this.serverSocketChannel.close();
+	        } catch (IOException e) {
+	        	logger.severe("Error closing server" + e.getMessage());
+	        }
         }
     }
 
@@ -97,34 +131,19 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         this.policyFilePath = policyFile;
     }
 
-    public String getPolicyFile() {
-        return this.policyFilePath;
-    }
-
     public void setPort(int port) {
         this.port = port;
     }
 
-    public int getPort() {
-        return this.port;
-    }
+	public void setSocketTimeout(String timeout) {
+		try {
+			this.socketTimeout = Long.parseLong( timeout );
+		}catch( NumberFormatException e ) {
+			logger.severe( "Unable to covert timout value from connetor. Default value 60S is used." );
+		}
+	}
 
-    @Override
-    public void setAttribute(String s, Object o) {
-        attributes.put(s, o);
-    }
-
-    @Override
-    public Object getAttribute(String s) {
-        return attributes.get(s);
-    }
-
-    @Override
-    public Iterator getAttributeNames() {
-        return attributes.keySet().iterator();
-    }
-
-    @Override
+	@Override
     public void setAdapter(Adapter adapter) {
         this.adapter = adapter;
     }
@@ -134,99 +153,76 @@ public class SocketPolicyProtocolHandler implements ProtocolHandler {
         return adapter;
     }
 
+    /**
+     * Initializes the parameters for flash socket policy server.
+     */
     @Override
-    public void init() throws Exception {
-        LOG.info(adapter.getClass().getName());
-        LOG.info(attributes.toString());
-        LOG.info("Initializing Flash Socket Policy protocoll handler on port: " + port);
-        if (policyFilePath != null) {
-            LOG.info("Using policy file: " + policyFilePath);
-            File file = new File(policyFilePath);
-            BufferedReader reader = new BufferedReader(new FileReader(file));
-            String line;
-            StringBuffer buffy = new StringBuffer();
-            while ((line = reader.readLine()) != null) {
-                buffy.append(line);
+    public void init() {
+    	
+    	logger.info( "Initializing Flash Socket Policy protocol handler on port: " + port );
+        if ( policyFilePath != null ) {
+        	
+        	logger.info( "Using policy file: " + policyFilePath );
+            File file = new File( policyFilePath );
+            try{
+	            BufferedReader reader = new BufferedReader( new FileReader( file ) );
+	            String line;
+	            StringBuffer buffy = new StringBuffer();
+	            while ( ( line = reader.readLine() ) != null ) {
+	                buffy.append( line );
+	            }
+	            buffy.append("\0");
+	            POLICY_RESPONCE = buffy.toString();
+	            reader.close();
+            } catch( IOException e ) {
+            	logger.severe( "Unable to read policyfile from \"" + policyFilePath + "\".\n" + e.getStackTrace() );
             }
-            buffy.append("\0");
-            policy = buffy.toString();
         } else {
-            LOG.info("Using default policy file: " + policy);
+        	logger.info( "Using default policy file: " + POLICY_RESPONCE );
         }
-    }
-
-    @Override
-    public void start() throws Exception {
-        startSocket();
     }
 
     @Override
     public void pause() throws Exception {
-
     }
 
     @Override
     public void resume() throws Exception {
-
     }
 
     @Override
     public void destroy() throws Exception {
-        requestShutDown();
-        executor.shutdown();
+    	this.requestShutDown();
     }
 
-}
+	@Override
+	public Executor getExecutor() {
+		return null;
+	}
 
-class WorkerRunnable implements Runnable {
-    Socket clientSocket;
-    String policy;
-    Logger LOG = Logger.getLogger(WorkerRunnable.class.getName());
+	@Override
+	public boolean isAprRequired() {
+		return false;
+	}
 
-    public WorkerRunnable(Socket clientSocket, String policy) {
-        this.clientSocket = clientSocket;
-        this.policy = policy;
-    }
+	@Override
+	public boolean isCometSupported() {
+		return false;
+	}
 
-    @Override
-    public void run() {
-        OutputStream out = null;
-        InputStream in = null;
-        try {
-            out = clientSocket.getOutputStream();
-            in = clientSocket.getInputStream();
-            byte[] buf = new byte[1024];
-            int count;
-            while (((count = in.read(buf)) > 0)) {
-                if (count == 23 && new String(buf).startsWith(SocketPolicyProtocolHandler.expectedRequest)) {
-                    try {
-                        out.write(policy.getBytes());
-                        LOG.info("Sent policy");
-                    } catch (IOException ex) {
-                        LOG.severe("Error sending policy file");
-                    }
+	@Override
+	public boolean isCometTimeoutSupported() {
+		return false;
+	}
 
-                } else {
-                    out.write(buf, 0, count);
-                    LOG.info("Ignoring Request");
-                }
-            }
-        }
-        catch (IOException e) {
-            LOG.severe("Socket read failed: " + e.getMessage());
-        }
-        finally {
-            try {
-                if (out != null) {
-                    out.flush();
-                    out.close();
-                    LOG.info("Flush output");
-                }
-                if (in != null)
-                    in.close();
-            } catch (IOException e) {
-                LOG.severe("Error closing in and out: " + e.getMessage());
-            }
-        }
-    }
+	@Override
+	public boolean isSendfileSupported() {
+		return false;
+	}
+
+	@Override
+	public void stop() throws Exception {
+		this.requestShutDown();
+	}
+
 }
