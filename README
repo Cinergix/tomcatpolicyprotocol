@@ -23,6 +23,6 @@ Default policy file is:
  You can also change the default policy file by specifying the absolute path to it:
   <Connector port="8111" policyFile="/policy.xml" protocol="flash.SocketPolicyProtocolHandler"/>
 	
-Keep alive time by default 30 seconds is set to the connector, you can change it like this,
+Connection timeout by default 30 seconds is set to the connector, you can change it like this,
 	<Connector socketTimeout="30" protocol="flash.SocketPolicyProtocolHandler"/>
 
